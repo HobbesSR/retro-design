@@ -6,6 +6,24 @@
 
 ---
 
+## Executive Summary
+
+The Real-time Embedded Tile & Raster Orchestrator (RETRO) represents an innovative approach to graphics processing that combines classic tile/sprite-based rendering techniques with modern 3D capabilities reminiscent of the PlayStation (PSX) and Nintendo 64 (N64) era. The system is designed with a focus on deterministic performance, low power consumption, and efficient use of on-die SRAM. RETRO employs a memory-mapped architecture that simplifies control while providing flexibility through multiple rendering modes and a novel pipeline selection mechanism.
+
+Key features include:
+
+*   Deterministic scanline-based rendering with no mandatory full-frame read-modify-write operations
+*   Memory-mapped control interface that simplifies development
+*   Multiple rendering modes (tile-dominant, polygon-dominant, and mixed)
+*   Efficient on-die SRAM utilization through a dynamic SRAM View Table (SVT)
+*   Novel pipeline selection through a per-tile PMID (Pipeline Mode ID) system
+*   RGB6666 framebuffer with 6-bit auxiliary channel for alpha/depth/special data
+*   Built-in RISC-V scene controller with specialized accelerators
+*   Hardware-accelerated color transformations through a Color Math Unit (CMU)
+*   Optional shader-like programmable capabilities for enhanced flexibility
+
+---
+
 ## ⚠️ Work in Progress
 
 This repository is in the early stages of design and experimentation. The architecture, documentation, and code are subject to radical change. Nothing here is final.
@@ -29,6 +47,7 @@ To understand the vision and architecture of RETRO, please start by reading the 
 1.  **[White Paper](./docs/whitepaper.md)**
 2.  **[Requirements](./docs/requirements.md)**
 3.  **[Roadmap](./docs/roadmap.md)**
+4.  **[Comprehensive Analysis](./docs/analysis.md)** - For a deep dive into the design context and comparisons.
 
 ## License
 
