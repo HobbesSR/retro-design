@@ -10,11 +10,28 @@ This document tracks the key architectural decisions, open questions, and potent
 *   **Options**:
     *   `16x16` tiles (Default proposal)
     *   `8x8` tiles (Optional)
-*   **Analysis Needed**:
-    *   Memory cost of each option.
-    *   Flexibility vs. overhead. A finer granularity (8x8) offers more creative control but increases map size and cache pressure.
-    *   Impact on the RISC-V scene controller's ability to update the map in real-time.
-*   **Decision**: TBD
+*   **Analysis**:
+    *   **Memory Cost**: The PMID map is a 2D array covering the screen. Assuming 1 byte per PMID entry:
+        *   **For a 320x240 screen:**
+            *   `16x16` granularity: `(320/16) x (240/16)` = `20 x 15` = **300 bytes**.
+            *   `8x8` granularity: `(320/8) x (240/8)` = `40 x 30` = **1200 bytes**.
+        *   **For a 480x272 screen:**
+            *   `16x16` granularity: `(480/16) x (272/16)` = `30 x 17` = **510 bytes**.
+            *   `8x8` granularity: `(480/8) x (272/8)` = `60 x 34` = **2040 bytes**.
+        *   The `8x8` option requires **4x** the memory of the `16x16` option, making it significantly more expensive in terms of on-die SRAM.
+
+    *   **Flexibility vs. Overhead**:
+        *   `16x16` Granularity: Provides a good balance. It's fine enough for status bars, water effects, or splitting the screen for different rendering styles without excessive memory overhead. It aligns well with common tile sizes (e.g., 16x16 tiles).
+        *   `8x8` Granularity: Offers much greater creative control, allowing for smaller, more intricate effects, text boxes, or localized post-processing. However, this comes at the cost of the increased memory footprint and higher processing overhead.
+
+    *   **Performance & Hardware Impact**:
+        *   **PMID Fetch**: The hardware needs to fetch the correct PMID for each 16x16 or 8x8 block of pixels. A larger map (`8x8`) may increase cache pressure if the map is cached, or require more bandwidth if fetched directly from SRAM.
+        *   **RISC-V Controller**: The CPU is responsible for updating this map. A map that is 4x larger will take 4x longer to clear or modify, consuming valuable CPU cycles during VBlank. For dynamic effects that change the map every frame, this could become a bottleneck.
+
+*   **Recommendation**:
+    *   Commit to **`16x16` granularity as the baseline standard** for RETRO. This provides a strong balance of flexibility and resource efficiency, which is core to the project's philosophy. It is sufficient for the majority of targeted use cases (status bars, screen splits, localized effects) without imposing a significant memory or performance tax.
+    *   Treat `8x8` granularity as a **potential future extension or a build-time option**, but not a requirement for the reference implementation. This allows the core design to remain lean while leaving the door open for more advanced use cases if a specific project can afford the 4x increase in resource consumption. By not requiring it in the baseline, we simplify the hardware and firmware for the majority of users.
+*   **Decision**: **`16x16` baseline**, with `8x8` as a possible non-standard extension.
 
 ---
 
