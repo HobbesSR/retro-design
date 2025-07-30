@@ -1,345 +1,199 @@
-# RETRO - White Paper
+# RETRO: A Neo-Retro Graphics Processing System - White Paper
 
-*A low‑power, deterministic, neo‑retro video processor that blends tile/sprite PPUs with PSX/N64‑era features, optimized for on‑die SRAM and memory‑mapped simplicity.*
+## Executive Summary
 
----
+The Real-time Embedded Tile & Raster Orchestrator (RETRO) represents an innovative approach to graphics processing that combines classic tile/sprite-based rendering techniques with modern 3D capabilities reminiscent of the PlayStation (PSX) and Nintendo 64 (N64) era. The system is designed with a focus on deterministic performance, low power consumption, and efficient use of on-die SRAM. RETRO employs a memory-mapped architecture that simplifies control while providing flexibility through multiple rendering modes and a novel pipeline selection mechanism.
 
-## 1. Purpose & Vision
+Key features include:
 
-RETRO delivers classic console immediacy (scanline compositing, tiles/sprites, raster tricks) with modern embedded pragmatism (memory‑mapped control, a tiny RISC‑V scene controller, low power). It targets hobbyist TFTs and embedded products at **30–60 FPS**, emphasizing **on‑die SRAM used purposefully** and optional external PSRAM for larger scenes.
+*   Deterministic scanline-based rendering with no mandatory full-frame read-modify-write operations
+*   Memory-mapped control interface that simplifies development
+*   Multiple rendering modes (tile-dominant, polygon-dominant, and mixed)
+*   Efficient on-die SRAM utilization through a dynamic SRAM View Table (SVT)
+*   Novel pipeline selection through a per-tile PMID (Pipeline Mode ID) system
+*   RGB6666 framebuffer with 6-bit auxiliary channel for alpha/depth/special data
+*   Built-in RISC-V scene controller with specialized accelerators
+*   Hardware-accelerated color transformations through a Color Math Unit (CMU)
+*   Optional shader-like programmable capabilities for enhanced flexibility
 
-**Core principles**
-
-*   **Deterministic scanline generation** with a small line buffer (no mandatory full‑frame RMW passes).
-*   **Memory‑mapped everything**: data‑as‑control; write memory, hardware reacts.
-*   **Mode‑aware flexibility**: tile‑dominant, poly‑dominant, and mixed profiles.
-*   **On‑die SRAM optimized for role** via a *SRAM View Table (SVT)*.
-*   **Novel compositing**: per‑tile pipeline selection (PMID map) and DMA‑tagged overrides.
-*   **Optional primitive shader‑like features**: low‑power vertex‑like transforms and programmable pixel operations that extend CMU functionality.
-
----
-
-## 2. High‑Level Requirements
-
-*   **Output**: Parallel RGB **DPI** (RGB666 primary, RGB888 optional); 30–60 Hz; supports 320×240 (baseline), 480×272 (extended), optional 800×480 via PSRAM.
-*   **Framebuffer (on‑die)**: **RGB6666** (6:6:6 + 6‑bit Aux) **double‑buffered at 320×240** (~600 KB). Aux channel = alpha/depth/special.
-*   **Addressing model**: framebuffer supports **3‑byte word addressing** (24‑bit pixel words) *and* packed/unpacked bridges for DMA. Internally, banks are power‑of‑two aligned.
-*   **Host I/O**: Memory‑mapped bus via SPI/QSPI/AHB‑like bridge; optional **QSPI/OPI PSRAM** for large assets/FB planes.
-*   **RISC‑V scene controller**: RV32IMC (80–120 MHz) with light SIMD and memory‑mapped accelerators (blit/fill/edge/palette/HSL/vertex).
-
-**Risks & mitigations:**
-
-*   PSRAM latency could starve pipelines → **require sequential bursts and prefetch scheduling**.
-*   On‑die FB writeback vs scanout hazards → **strict double buffering enforced**.
-*   Pixel pipe overload → **cap sources per PMID (≤3) and limit per‑pixel recipe complexity to 3–4 cycles**.
+This paper analyzes the architecture, design choices, and potential applications of RETRO, highlighting how it bridges the gap between retro graphics systems and modern embedded graphics requirements.
 
 ---
 
-## 3. Mode Hierarchy
+## 1. Introduction and Background
 
-**High‑level modes** (select at VBlank; sub‑modes tuned recipes):
+### 1.1 Context of Retro Graphics Systems
 
-*   **A) Tile‑Dominant**: Multi‑BG tilemaps, sprites, affine (Mode‑7‑like), palette math.
-*   **B) Poly‑Dominant**: PSX‑style quads w/ ordering tables, optional perspective tris, line‑Z or FB‑Z.
-*   **C) Mixed**: Hybrid 2D+3D, post‑FX, selective writeback and FB sampling.
+Retro gaming consoles of the 1980s and 1990s employed specialized graphics hardware known as Picture Processing Units (PPUs) that were optimized for tile and sprite-based rendering. These systems, exemplified by the Nintendo Entertainment System (NES) and Super Nintendo Entertainment System (SNES), utilized fixed hardware pipelines to compose images scanline by scanline, with dedicated memory for tile patterns, sprite attributes, and color palettes.
 
-Per‑tile **PMID map** (16×16 default granularity; 8×8 optional) selects sources (BG/SPR/TRI/FB), a combiner recipe, and feature flags (Z test, bilinear, HSL enable, HUD‑bypass fog, shader enable, etc.).
+The transition to 3D graphics in the mid-1990s, led by systems like the PlayStation (PSX) and Nintendo 64 (N64), introduced polygon-based rendering while still maintaining some of the scanline-based processing approaches. These systems featured dedicated hardware for transforming and rasterizing polygons, with varying approaches to texture mapping and shading.
 
-**Risk:** Mixed Z policies could conflict → **band‑level policy: one Z type per band, tiles may disable but not change Z type.**
+### 1.2 The Neo-Retro Approach
 
----
+RETRO represents a "neo-retro" approach that combines the best aspects of these classic systems with modern design principles:
 
-## 4. Memory‑Mapped Architecture
+*   **Classic Console Immediacy**: Maintains the scanline-by-scanline rendering approach that allows for deterministic timing and "raster tricks" (mid-frame modifications).
+*   **Modern Embedded Pragmatism**: Incorporates memory-mapped control, efficient SRAM usage, and low-power design suitable for embedded applications.
+*   **Hybrid Rendering Capabilities**: Supports both tile/sprite-based 2D and polygon-based 3D rendering with flexible mixing.
 
-Everything appears as **logical regions** within a single address space; writing data triggers side‑effects (cache invalidates, prefetch, wakes). Control is structured as small **config blocks** (not scattered bitfield registers).
-
-### 4.1 SRAM View Table (SVT)
-
-A compact table the firmware writes at VBlank to bind **physical SRAM banks** to **logical regions** and their **ports/policies**. Enables role‑optimized SRAM without hard partitioning the design.
-
-**Logical region types (examples)**
-
-*   **Tile Pattern Cache** (read‑mostly; row‑aligned; prefetch‑friendly)
-*   **Tilemap / ModeMap** (tile entries + per‑tile PMID)
-*   **Sprite Attributes / Pattern Rows**
-*   **Ordering Tables (OT) / Edge & Span Buffers**
-*   **Line‑Z / Coverage**
-*   **Combiner & HSL/Shader Param Tables / Palettes**
-*   **Framebuffer(s) RGB6666** (scanout + selective writeback)
-*   **DMA rings & descriptors**
-
-**Risk:** SVT rebinds could cause conflicts → **limit rebinds to VBlank and provide build‑time SVT conflict analyzer.**
-
-### 4.2 Porting strategy (Area/Power conscious)
-
-*   **Dual‑port where concurrency is real**: Tile Pattern Cache, Sprite Attrs, On‑die FB (scanout vs writeback).
-*   **Single‑port elsewhere** with phase separation (prefetch vs shade): OT, Edge, Line‑Z, LUTs, DMA rings.
-
-### 4.3 Multi‑purpose bank pairings (typical)
-
-*   **Tilemap/ModeMap ↔ Ordering Tables** (2D vs PSX‑like 3D)
-*   **Line‑Z ↔ Line scratch / Sprite overflow** (3D vs 2D)
-*   **Combiner/HSL/Shader tables ↔ Palette RAM**
+This approach is particularly well-suited for hobbyist TFT displays and embedded products that require graphics capabilities but have constrained power and memory resources.
 
 ---
 
-## 5. Framebuffer & Addressing Choices
+## 2. Core Architecture and Design Philosophy
 
-### 5.1 RGB6666 on‑die FB
+RETRO is built on several core principles that define its architecture.
 
-*   **6:6:6 RGB + 6 Aux**; Aux used per‑mode for alpha, coarse depth, or pipeline tags.
-*   **Double‑buffered 320×240** on‑die; 480×272 single‑buffer is plausible; **800×480** via PSRAM.
+### 2.1 Deterministic Scanline Generation
 
-**Mitigation:** Strict double buffering; writeback never targets the active scanout buffer.
+Unlike modern GPUs that typically require multiple passes over a full framebuffer, RETRO processes graphics scanline by scanline with minimal buffering. This approach reduces memory bandwidth requirements, enables precise timing control, allows for mid-frame modifications (raster effects), and simplifies synchronization with display hardware.
 
-### 5.2 24‑bit word addressing (3‑byte) — implications
+### 2.2 Memory-Mapped Architecture
 
-*   Convenient for **packed DMA** and external RGB888 interfacing; awkward for raw byte math.
-*   We hide misalignment by using **wide internal buses** and line‑oriented access; firmware rarely touches pixels randomly.
+All control and data interfaces in RETRO are memory-mapped. Hardware functionality is controlled by writing to specific memory addresses, unifying data and control to simplify the programming model.
 
-### 5.3 Alternative: channel‑separated internal layout (hybrid)
+### 2.3 Mode-Aware Flexibility
 
-*   Internally store R, G, B, Aux in aligned banks (1B/chan), reconstruct at combiner/scanout.
-*   Externally **expose packed 24‑bit** path for DMA transfers.
-*   Benefits: clean addressing, cheap per‑channel ops (LUT/HSL/shader), easy upgrades for Aux (e.g., 8‑bit alpha or 16‑bit Z plane when needed).
+The system supports three primary rendering modes:
 
-**Recommendation:** Use the **hybrid**—internally channel‑separate for aligned math and block ops; pack/unpack at DMA boundary to keep compatibility and compact storage.
+*   **Tile-Dominant**: Optimized for 2D graphics with multiple background layers, sprites, and affine transformations.
+*   **Polygon-Dominant**: Focused on 3D rendering with PSX-style quads or perspective-correct triangles.
+*   **Mixed**: Combines 2D and 3D elements with selective post-processing effects.
 
----
+### 2.4 On-Die SRAM Optimization
 
-## 6. Pipelines (Fixed‑Function, Scanline‑Driven)
+RETRO employs a novel SRAM View Table (SVT) that dynamically maps physical SRAM banks to logical functions, allowing for efficient use of limited on-die SRAM and flexible reconfiguration between rendering modes.
 
-### 6.1 Tile Engine (BG layers)
+### 2.5 Novel Compositing System
 
-*   Tile sizes: **4/8/16/32/64** (square, power‑of‑two).
-*   Features: per‑layer affine (Mode‑7‑like), line/column scroll, mosaic, palette select, **per‑tile transforms** (H‑flip, V‑flip, 90/180/270° rotations via address swizzles).
-*   **Tile entry schema** (select via map schema register):
-    *   **16‑bit compact**: tile\_id (hi/lo), rot(2), v/h flip, palette/priority.
-    *   **32‑bit extended**: tile\_id(16), palette/bank(4), rot(2), v/h flip, **per‑tile PMID override**, misc flags.
-
-### 6.2 Sprite Engine
-
-*   96–128 sprites, up to 64×64, per‑sprite affine, palette or direct color, mesh or true alpha.
-*   Per‑scanline active list; row caches; priority & window masks.
-
-**Mitigation:** Cap active sprites per line (e.g., ≤128) to ensure RISC‑V and prefetchers meet timing.
-
-### 6.3 Tri/Quad Engine
-
-*   **PSX‑style quads** (affine map, Gouraud) with **ordering tables** (no Z) *or* perspective‑correct triangles with **line‑Z** (optional FB‑Z plane).
-*   Texture sampling: nearest; optional bilinear for FB sampling (gated by PMID).
-
-**Risk:** OT and Z could conflict if mixed per tile → **enforce mutual exclusivity per PMID.**
-
-### 6.4 Compositor (Combiner)
-
-*   Inputs: BG, SPR, TRI, FB‑A/B sample, CONST/FOG, **CMU (HSL/YUV) stage**, **Shader Stage**.
-*   Recipes: 8–16 small opcode pipelines (add/sub/lerp/min/max/XOR + alpha factors + shader stage outputs).
-*   **Z‑test**: line‑Z or FB‑Z if enabled. Ordered painter’s mode when Z off.
-
-**Mitigation:** Limit max sources per PMID (e.g., ≤3) and gate HSL and shader stage by PMID to meet pixel budget.
-
-### 6.5 Shader Stage (Primitive Shaders)
-
-*   Optional programmable stage that executes **small vertex‑like transforms** or **pixel‑level arithmetic** on attributes (position, color, depth).
-*   Reuses the same infrastructure as CMU, parameterized per PMID.
-*   Examples:
-    *   Vertex‑like: apply translation/scale/rotation to coordinates before rasterization.
-    *   Pixel‑like: apply conditional blending, color modulation, or additional math beyond CMU.
-*   Parameters stored in a **Shader Param Table**; operations are fixed‑cycle and heavily constrained to avoid stalls.
-
-**Mitigation:** Restrict shader ops to a small, deterministic instruction set (e.g., ≤4 ops per pixel/vertex) and clock‑gate when disabled.
+The system introduces a per-tile pipeline selection mechanism (PMID) that allows different rendering pipelines to be applied to different screen regions, supporting up to 3 sources per pixel with configurable combining operations and selective application of effects.
 
 ---
 
-## 7. Color Math Unit (CMU): HSL‑style Hardware
+## 3. Memory Architecture and Organization
 
-**Live per‑pixel** and **block‑op** HSL editing without general shaders.
+### 3.1 SRAM View Table (SVT)
 
-*   **Live path (combiner stage)**: RGB→YUV → hue‑rotate (2×2), saturation scale, lightness gain/offset → RGB → dither.
-    *   Parameters indexed by PMID → **HSL Param Table** (e.g., 16 rows; `{θ, s, g, o, flags}` in fixed‑point).
-    *   Optional gamma LUTs for linearization when applying lightness.
-*   **Block‑op path**: apply HSL over FB regions, tile atlases, or palettes.
-    *   Modes: **YUV‑fast** (same as live) or **Exact HSL** (piecewise max/min; slower, offline only).
+The SRAM View Table is a key innovation in the RETRO architecture. It provides a flexible mechanism for mapping physical SRAM banks to logical functions, allowing the system to adapt to different rendering modes and workloads without requiring fixed memory partitioning. The SVT is configured by firmware at VBlank.
 
-**Fixed‑point**: cos/sin LUT (Q1.8), YUV Q formats; 1 px/cycle when enabled; fully clock‑gated when not in use.
+### 3.2 Logical Memory Regions
 
-**Mitigation:** Do CMU math at ≥9‑bit internal and ordered‑dither back to RGB666 to avoid banding.
+RETRO defines several logical memory regions that can be mapped to physical SRAM banks:
 
----
+*   Tile Pattern Cache
+*   Tilemap/ModeMap
+*   Sprite Attributes/Pattern Rows
+*   Ordering Tables/Edge & Span Buffers
+*   Line-Z/Coverage
+*   Combiner & HSL/Shader Parameter Tables/Palettes
+*   Framebuffer
+*   DMA rings & descriptors
 
-## 8. Shader‑Lite Programmability (Microcode Units)
+### 3.3 Framebuffer Design
 
-Add **primitive, low‑power “shader‑like” features** that extend flexibility without turning RETRO into a general shader GPU. Three tiny, fixed‑budget units cover the useful space: a **Vertex Micro‑Engine (VME)**, a **Varying Interpolator (VI)**, and **Parametric Pixel Math (PPM)** that integrates with the combiner/CMU.
-
-### 8.1 Vertex Micro‑Engine (VME)
-
-A small, deterministic micro‑engine that runs **per‑vertex** programs to prepare rasterization parameters.
-
-*   **Purpose**: apply **2D/2.5D transforms**, generate varyings (e.g., UVs, color), and set per‑primitive constants (fog factor, combiner constants), without waking the host CPU.
-*   **Instruction set (fixed‑point, no loops)**: `ADD`, `MUL`, `MAD`, `SHL/SHR`, `CLAMP`, `DOT2/3`, `MUL_MAT2x3`, `RECIP_APPROX` (optional), `PACK`. All Q formats are implementation‑fixed (e.g., 16.16 or 12.4 depending on target).
-*   **State**: 16 scalar registers, 16 constants, program length ≤ **32 ops**. Program memory ≤ **1 KB**; selected by **sub‑mode** or draw‑call header.
-*   **Outputs**: screen‑space `{x,y}`, **depth `z`**, up to **two varyings** `v0,v1` (e.g., UV or color), and optional `w` for perspective.
-*   **Interface**: VME writes **edge/plane coefficients** and **varying seeds** into the **Edge & Span Buffers** (logical region). The **Tri/Quad Engine** consumes them.
-
-**Examples**
-
-*   2D affine sprite batches (matrix apply + color scale per sprite).
-*   Billboards: face camera by building a 2×2 basis and offsetting vertex quad.
-*   Simple lighting: `color = dot(n, l) * base` for flat‑lit polys.
-
-**Risk & Mitigation**
-
-*   *Risk*: VME cannot process all vertices in time for the next band.
-    *Mitigation*: cap vertices per band; provide a **vertex FIFO depth** and **back‑pressure counter**; allow RISC‑V to pre‑bake vertices for overflow cases.
-
-### 8.2 Varying Interpolator (VI)
-
-*   **Function**: hardware computes per‑span/per‑pixel interpolation of **up to two varyings** selected by the VME. Modes: **affine** or **perspective‑correct** (uses `w`/`z`).
-*   **Setup**: VME emits plane equations; VI converts to **per‑span steps** during the **prefetch phase**.
-*   **Delivery**: interpolated `v0,v1` available as inputs to the **Combiner** and/or **CMU**.
-
-**Risk & Mitigation**
-
-*   *Risk*: Allowing >2 varyings explodes area/latency.
-    *Mitigation*: **Hard‑limit to two**; if more are needed, encode additional effects via **PMID recipes** or pre‑bake into textures.
-
-### 8.3 Parametric Pixel Math (PPM)
-
-A tiny **per‑pixel arithmetic stage** that complements CMU.
-
-*   **Ops**: `MUL`, `ADD`, `MAD`, `SAT`, `THRESH`, and **1D LUT sample**. Operates on **combiner inputs** and/or `v0,v1` from VI.
-*   **Use cases**: distance‑based fog from `z`, toon thresholds, color modulate by v0, alpha from LUT(v1), cheap dissolve masks.
-*   **Control**: **PMID recipe** selects **one of N PPM programs** (e.g., N=8) stored in a small table (each 3–5 ops max).
-*   **Placement**: **Before** CMU (so HSL can act on PPM‑modified RGB) or **after** (for post‑grade thresholds), selectable per recipe.
-
-**Risk & Mitigation**
-
-*   *Risk*: PPM complexity jeopardizes the **3–4 cycle** pixel pipe budget.
-    *Mitigation*: compile‑time **op‑budget per recipe**; hardware rejects configurations that exceed the budget; **≤3 sources** per PMID enforced.
-
-**Notes**
-
-*   The existing **CMU (HSL)** acts as a specialized “pixel shader‑lite” stage; PPM provides the general arithmetic glue without opening a full shader model.
-*   All shader‑lite features are **fully clock‑gated** when unused.
+RETRO employs an RGB6666 framebuffer format (6 bits each for R, G, B, and a 6-bit Aux channel). The system supports a hybrid approach to framebuffer organization: internally, channels can be separated for efficient operations, while externally, a packed 24-bit interface is provided for DMA. Double buffering is strictly enforced.
 
 ---
 
-## 9. DMA‑Aware Compositing & Block Operations
+## 4. Rendering Pipelines and Processing
 
-### 9.1 DMA with PMID override
+### 4.1 Mode Hierarchy and PMID System
 
-*   DMA descriptors for FB/tilemap writes carry an optional **PMID override** and combiner flags. Blocks (e.g., 16×N) inherit that pipeline behavior without touching the main ModeMap.
+Rendering is organized into a hierarchy of modes. A per-tile PMID map divides the screen into 16×16 (or optionally 8×8) regions, each with a Pipeline Mode ID (PMID) that selects input sources, a combiner recipe, and feature flags.
 
-### 9.2 Block/Region Operations (memory‑mapped descriptors)
+### 4.2 Fixed-Function Pipelines
 
-Lightweight engines that walk rectangular regions using wide bank writes/reads:
+RETRO includes several fixed-function pipelines that operate on a scanline basis:
 
-*   **FILL**: constant color/Z/tile ID/attr.
-*   **BLIT**: src→dst copy (same or cross‑bank), masked or unmasked.
-*   **LUT**: apply 1D LUT to a region or palette (posterize, gamma tweak).
-*   **VECTOR‑ADD**: add Δ to sprite attr blocks (e.g., camera pan).
-*   **COMPARE/MASKED‑WRITE**: conditional region ops (e.g., Z<th).
-*   **TILE‑RNG‑FILL**: procedural tilemap fill using seeded LFSR/xorshift with optional lookup table, no‑repeat constraint, and transform bit probabilities (H/V/rot). Optional 8×8 weight map biases distribution.
-*   **HSL\_BLT**: region HSL edits (YUV‑fast or exact HSL) with gamma flags.
-*   **SHADER\_BLT**: execute primitive shader programs on blocks of pixels or vertices using the Shader Stage.
+*   **Tile Engine**: Supports various tile sizes and features per-layer affine transformations and per-tile transforms.
+*   **Sprite Engine**: Handles 96-128 sprites with per-sprite affine transformations and alpha blending.
+*   **Tri/Quad Engine**: Processes PSX-style quads or perspective-correct triangles, using ordering tables or line-Z for depth.
+*   **Compositor (Combiner)**: Combines inputs from multiple sources, applies blending recipes, and performs Z-testing.
 
-**Mitigation:** Epoch bit system to avoid DMA/ModeMap races (only apply overrides for current epoch).
+### 4.3 Color Math Unit (CMU)
 
-All exposed as simple **descriptor structs** in memory; engines run concurrently if banks don’t conflict.
+The CMU provides hardware-accelerated color transformations in HSL color space, enabling dynamic color grading and special effects without general-purpose shaders.
 
----
+### 4.4 Shader-Lite Programmability
 
-## 10. Scheduling & Timing (Meeting Deadlines)
+Optional "shader-lite" programmable stages extend flexibility:
 
-*   **Phases per line**: Prefetch (−2…−1 lines), Shade (current), Scanout (current) with small elastic FIFOs.
-*   **Miss policy**: Fallback color on cache miss; perf counters record late/miss stats for tuning.
-*   **Epoch flip**: Double‑buffered control pages (SVT, combiner/HSL tables, mode config, **PPM programs**) swapped at VBlank or region boundary.
-
-**Mitigation:** Hardware fault counters for SVT conflicts, ModeMap epoch mismatches, OT/Z invalid combinations, and **VME/VI underflow** (so firmware can throttle draw calls).
+*   **Vertex Micro-Engine (VME)**: Executes small per-vertex programs for 2D/2.5D transforms.
+*   **Varying Interpolator (VI)**: Hardware-accelerated interpolation of up to two varying parameters.
+*   **Parametric Pixel Math (PPM)**: A small per-pixel arithmetic stage for custom effects.
 
 ---
 
-## 11. RISC‑V Scene Controller & Accelerators
+## 5. Memory Management and DMA Operations
 
-*   RV32IMC + light SIMD (packed 8/16‑bit ops) accelerates affine steps, list builds, palette math.
-*   Writes **Scanline Recipes** and maintains OT bins, edge spans, sprite lists, ModeMap updates.
-*   Programs block‑ops by writing descriptors into **per‑bank command FIFOs** (also memory‑mapped regions).
-*   **Feeds shader‑lite**: loads **VME programs**, **PPM tables**, and HSL params; validates recipe op‑budgets.
+### 5.1 DMA-Aware Compositing
 
-**Mitigation:** Provide assist accelerators for span/OT building so RISC‑V enqueues rather than computes in real‑time; expose **vertex FIFO depth** to firmware for back‑pressure control.
+DMA operations are integrated into the rendering pipeline through PMID overrides in DMA descriptors and an epoch bit system to prevent race conditions.
 
----
+### 5.2 Block/Region Operations
 
-## 12. Developer Model (Ergonomics)
-
-*   **Write memory, not registers**: tilemaps, sprites, OT, HSL/combiner/shader tables, FB—everything is a region.
-*   **Switch modes** by writing a small **Mode Control Block (MCB)** that points to SVT + recipe tables; flip at VBlank.
-*   **Per‑tile artistry**: rotate/mirror flags; per‑tile PMID overrides; color grading via CMU; shader toggles.
-*   **Procedural content**: RNG tile fills, LUT/HSL ops, and Shader Stage programs with one descriptor write.
-
-**Mitigation:** Freeze a canonical memory map and headers/codegen from spec to keep developer UX clean.
+Hardware-accelerated block operations (`FILL`, `BLIT`, `LUT`, etc.) provide efficient memory manipulation without CPU intervention.
 
 ---
 
-## 13. Open Decisions / Tunables
+## 6. RISC-V Scene Controller
 
-*   **PMID granularity**: 16×16 default, 8×8 optional.
-*   **Internal layout**: commit to **hybrid** (channel‑sep internal + 24‑bit packed DMA), or allow build‑time selection.
-*   **Perspective path**: always available or gated by a perf bit.
-*   **Bilinear**: FB sampling only (post‑FX) vs also for textures.
-*   **Panel baseline**: 320×240 vs 480×272 as the dev‑kit default.
-*   **Shader Stage**: define instruction set and resource limits (≤4 ops/pixel and ≤8 ops/vertex recommended).
+An integrated RISC-V processor (RV32IMC) serves as a scene controller, managing scanline recipes, ordering tables, sprite lists, and block operations, offloading real-time graphics tasks from the host CPU.
 
 ---
 
-## 14. Appendix — Example Structs (Sketch)
+## 7. Developer Model and Ergonomics
 
-**PMID Map Entry (1 byte)**
-```
-bit7    : HSL enable
-bit6    : Shader enable
-bit5    : Z test enable / FB bilinear (mode‑dep)
-bits4:3 : Combiner index (0..3 or 0..15 in extended)
-bits2:0 : Pipeline select (BG/SPR/TRI/FB_A/FB_B/mixed)
-```
+RETRO is designed for simplicity:
 
-**Shader Param Table Row (example)**
-```
-uint8 ops[4];       // up to 4 fixed ops (encoded)
-int16 params[4];    // params for ops (e.g., scale, offset, threshold)
-```
+*   **Memory-Mapped Control**: The entire system is controlled through memory writes, with no complex register programming.
+*   **Simple Mode Switching**: Modes are changed by writing a Mode Control Block (MCB) at VBlank.
+*   **Per-Tile Artistry**: The PMID system enables fine-grained control over rendering and effects on a per-tile basis.
+*   **Procedural Content**: Supported through RNG tile fills, LUT/HSL operations, and shader programs.
 
-**HSL Param Table Row (8 bytes)**
-```
-uint8  theta_idx;   // 0..255 ≈ 0..360°
-uint8  sat_q1_8;    // 0..2.0×
-uint8  gain_q1_8;   // 0..2.0×
-int8   offset_q1_8; // −1..+1
-uint8  flags;       // gamma on/off, clamp mode, etc.
-uint8  reserved[3];
-```
+---
 
-**Tile Entry (32‑bit extended, schema‑dependent)**
-```
-[31:16] tile_id
-[15:12] palette/bank
-[11:10] rot (0,90,180,270)
-[9]     v_flip
-[8]     h_flip
-[7:4]   per‑tile PMID/combiner/shader override
-[3:0]   misc flags (blend, mask, size override)
-```
+## 8. Comparative Analysis
 
-**TILE_RNG_FILL Descriptor (sketch)**
-```
-struct RNGFill {
-  u32 dst_base, stride_tiles;
-  u16 width_tiles, height_tiles;
-  u32 seed;            // LFSR/xorshift seed
-  u32 table_base;      // optional tile ID table
-  u16 table_len;       // 0 => uniform over range
-  u8  mode;            // bits: algo | no_repeat | mask_write
-  u8  prob_rot_flip;   // packed probabilities (rot/flip weights)
-};
-```
+### 8.1 Comparison with Classic Tile/Sprite Systems (NES/SNES)
+
+RETRO enhances classic PPU concepts with higher color depth, larger tile sizes, flexible per-tile pipeline selection, and hardware-accelerated color math.
+
+### 8.2 Comparison with PSX/N64 Era Systems
+
+RETRO modernizes early 3D concepts with a unified, flexible memory architecture, simplified memory-mapped control, and more sophisticated color processing.
+
+### 8.3 Modern Embedded Considerations
+
+RETRO is designed for modern embedded systems with a focus on power efficiency (via scanline processing and clock gating), memory efficiency (via the SVT), and flexibility.
+
+---
+
+## 9. Potential Applications
+
+*   **Retro Gaming and Emulation**: Native support for 2D and early 3D gaming paradigms.
+*   **Embedded User Interfaces**: Efficient, low-power graphics for layered UIs.
+*   **Educational Platforms**: A simpler, more transparent model than modern GPUs for learning graphics concepts.
+*   **IoT and Smart Devices**: Low-complexity, efficient graphics for smart displays.
+
+---
+
+## 10. Technical Challenges and Mitigations
+
+*   **PSRAM Latency**: Mitigated by burst access, prefetching, and caching.
+*   **Framebuffer Hazards**: Mitigated by strict double buffering.
+*   **Pixel Pipeline Overload**: Mitigated by limiting sources and recipe complexity.
+*   **Z-Policy Conflicts**: Mitigated by enforcing a single Z-policy per scanline band.
+*   **SVT Rebind Conflicts**: Mitigated by limiting rebinds to VBlank and providing a conflict analyzer.
+
+---
+
+## 11. Future Considerations and Open Decisions
+
+Key design questions remain open for further study, including final PMID granularity, bilinear filtering support, and shader resource limits. These are tracked in `studies/design_conflicts.md`.
+
+---
+
+## 12. Conclusion
+
+RETRO offers a compelling alternative to both fully programmable GPUs and fixed-function display controllers for embedded systems. Its deterministic nature, memory-mapped simplicity, and flexible rendering options address the specific needs of these applications while providing a powerful and fun platform for creative development.
